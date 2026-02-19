@@ -966,8 +966,12 @@ class InputBatch:
             num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
             # Also account for case where there may be a smaller number of
             # output placeholders (tokens can be discarded after a kv-load failure).
-            first_placeholder = req_output_token_ids.index(-1)
-            num_placeholders = len(req_output_token_ids) - first_placeholder
+            # Search backwards for first placeholder since -1s are at the tail.
+            n = len(req_output_token_ids)
+            first_placeholder = n - 1
+            while first_placeholder > 0 and req_output_token_ids[first_placeholder - 1] == -1:
+                first_placeholder -= 1
+            num_placeholders = n - first_placeholder
             num_to_replace = min(num_sampled_ids, num_placeholders)
             del new_ids[num_to_replace:]
             end_index = first_placeholder + num_to_replace
