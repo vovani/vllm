@@ -4,6 +4,8 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+import logging
+
 import torch
 from packaging import version
 
@@ -12,6 +14,237 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
+
+# Auto-generated from bench.py sweep on B200.
+# Key: (dstate, nheads, batch) -> (use_tiled, BLOCK_SIZE_M, num_warps)
+_SSM_CONFIG_B200 = {
+    ( 96,  16,    1): (True , 16, 2),  # 2.5 us
+    ( 96,  16,    2): (True ,  8, 4),  # 2.6 us
+    ( 96,  16,    4): (False, 16, 8),  # 2.7 us
+    ( 96,  16,    8): (True , 64, 4),  # 3.5 us
+    ( 96,  16,   16): (True , 64, 2),  # 4.6 us
+    ( 96,  16,   32): (False, 32, 4),  # 6.7 us
+    ( 96,  16,   64): (False, 32, 4),  # 11.9 us
+    ( 96,  16,  128): (False, 64, 8),  # 20.8 us
+    ( 96,  16,  256): (False, 64, 8),  # 38.6 us
+    ( 96,  16,  512): (False, 64, 8),  # 74.5 us
+    ( 96,  16, 1024): (False, 16, 1),  # 146.5 us
+    ( 96,  16, 2048): (False, 16, 2),  # 293.9 us
+    ( 96,  32,    1): (True , 32, 4),  # 2.6 us
+    ( 96,  32,    2): (True , 16, 8),  # 2.9 us
+    ( 96,  32,    4): (True , 64, 4),  # 3.4 us
+    ( 96,  32,    8): (False, 32, 8),  # 4.6 us
+    ( 96,  32,   16): (False, 32, 4),  # 6.5 us
+    ( 96,  32,   32): (False, 16, 4),  # 11.7 us
+    ( 96,  32,   64): (False, 32, 4),  # 20.9 us
+    ( 96,  32,  128): (False, 64, 8),  # 38.9 us
+    ( 96,  32,  256): (False, 64, 8),  # 74.3 us
+    ( 96,  32,  512): (False, 16, 1),  # 146.0 us
+    ( 96,  32, 1024): (False, 32, 2),  # 290.4 us
+    ( 96,  32, 2048): (False, 32, 2),  # 585.2 us
+    ( 96,  64,    1): (True , 32, 4),  # 2.9 us
+    ( 96,  64,    2): (True , 64, 4),  # 3.4 us
+    ( 96,  64,    4): (True , 32, 2),  # 4.2 us
+    ( 96,  64,    8): (False, 32, 4),  # 6.5 us
+    ( 96,  64,   16): (False, 32, 4),  # 11.6 us
+    ( 96,  64,   32): (False, 16, 2),  # 20.7 us
+    ( 96,  64,   64): (False, 32, 4),  # 39.0 us
+    ( 96,  64,  128): (False, 64, 8),  # 74.9 us
+    ( 96,  64,  256): (False, 16, 1),  # 145.4 us
+    ( 96,  64,  512): (False, 32, 2),  # 289.0 us
+    ( 96,  64, 1024): (False, 32, 2),  # 578.5 us
+    ( 96,  64, 2048): (False, 32, 2),  # 1167.9 us
+    ( 96, 128,    1): (True , 32, 2),  # 3.4 us
+    ( 96, 128,    2): (True , 64, 4),  # 4.5 us
+    ( 96, 128,    4): (False, 16, 2),  # 6.4 us
+    ( 96, 128,    8): (False, 16, 4),  # 11.4 us
+    ( 96, 128,   16): (False, 32, 4),  # 20.4 us
+    ( 96, 128,   32): (True , 64, 2),  # 38.6 us
+    ( 96, 128,   64): (False, 64, 8),  # 75.0 us
+    ( 96, 128,  128): (False, 32, 2),  # 146.8 us
+    ( 96, 128,  256): (False, 32, 2),  # 288.3 us
+    ( 96, 128,  512): (False, 32, 2),  # 575.7 us
+    ( 96, 128, 1024): (False, 32, 2),  # 1153.1 us
+    ( 96, 128, 2048): (False, 32, 2),  # 2334.5 us
+    (128,  16,    1): (False,  8, 8),  # 2.6 us
+    (128,  16,    2): (False,  8, 8),  # 2.8 us
+    (128,  16,    4): (False,  8, 1),  # 3.2 us
+    (128,  16,    8): (False,  8, 2),  # 3.9 us
+    (128,  16,   16): (False, 32, 4),  # 5.4 us
+    (128,  16,   32): (False, 32, 2),  # 8.1 us
+    (128,  16,   64): (False, 32, 4),  # 14.9 us
+    (128,  16,  128): (False, 32, 4),  # 26.6 us
+    (128,  16,  256): (False, 16, 4),  # 50.1 us
+    (128,  16,  512): (False, 32, 4),  # 97.4 us
+    (128,  16, 1024): (False, 64, 8),  # 192.7 us
+    (128,  16, 2048): (False, 64, 4),  # 387.1 us
+    (128,  32,    1): (False,  8, 1),  # 2.8 us
+    (128,  32,    2): (False, 16, 2),  # 3.2 us
+    (128,  32,    4): (False,  8, 2),  # 3.9 us
+    (128,  32,    8): (False,  8, 2),  # 5.4 us
+    (128,  32,   16): (False, 32, 2),  # 8.1 us
+    (128,  32,   32): (False, 32, 4),  # 14.4 us
+    (128,  32,   64): (False, 32, 4),  # 26.6 us
+    (128,  32,  128): (False, 32, 4),  # 50.2 us
+    (128,  32,  256): (False, 16, 4),  # 97.3 us
+    (128,  32,  512): (False, 64, 8),  # 192.1 us
+    (128,  32, 1024): (False, 64, 8),  # 383.3 us
+    (128,  32, 2048): (False, 64, 4),  # 771.3 us
+    (128,  64,    1): (False,  8, 1),  # 3.1 us
+    (128,  64,    2): (False,  8, 2),  # 3.9 us
+    (128,  64,    4): (False,  4, 2),  # 5.1 us
+    (128,  64,    8): (False, 32, 4),  # 8.0 us
+    (128,  64,   16): (False, 32, 4),  # 14.3 us
+    (128,  64,   32): (False, 32, 4),  # 26.2 us
+    (128,  64,   64): (False, 32, 4),  # 50.5 us
+    (128,  64,  128): (False, 64, 8),  # 97.8 us
+    (128,  64,  256): (False, 32, 8),  # 191.3 us
+    (128,  64,  512): (False, 64, 8),  # 381.1 us
+    (128,  64, 1024): (False, 64, 8),  # 763.3 us
+    (128,  64, 2048): (False, 64, 4),  # 1540.1 us
+    (128, 128,    1): (False,  8, 1),  # 4.0 us
+    (128, 128,    2): (False, 32, 8),  # 5.3 us
+    (128, 128,    4): (False,  8, 1),  # 7.7 us
+    (128, 128,    8): (False, 32, 4),  # 14.2 us
+    (128, 128,   16): (False, 32, 4),  # 25.9 us
+    (128, 128,   32): (False, 32, 4),  # 49.4 us
+    (128, 128,   64): (False, 32, 4),  # 97.8 us
+    (128, 128,  128): (False, 64, 8),  # 192.3 us
+    (128, 128,  256): (False, 32, 8),  # 379.7 us
+    (128, 128,  512): (False, 64, 4),  # 759.7 us
+    (128, 128, 1024): (False, 64, 4),  # 1524.5 us
+    (128, 128, 2048): (False, 64, 4),  # 3081.1 us
+}
+
+# Auto-generated from bench.py sweep on H100. Orig kernel only (no tiled).
+# Where the sweep chose tiled, the best aggregate orig config is used:
+# (96,128)→M=32,w=2, (96,64)→M=32,w=2, (96,32)→M=32,w=2, (96,16)→M=16,w=2.
+_SSM_CONFIG_H100 = {
+    ( 96,  16,    1): (False, 16, 2),
+    ( 96,  16,    2): (False, 16, 2),
+    ( 96,  16,    4): (False, 16, 8),
+    ( 96,  16,    8): (False, 16, 2),
+    ( 96,  16,   16): (False, 16, 2),
+    ( 96,  16,   32): (False, 32, 4),
+    ( 96,  16,   64): (False, 32, 4),
+    ( 96,  16,  128): (False, 64, 8),
+    ( 96,  16,  256): (False, 64, 8),
+    ( 96,  16,  512): (False, 64, 8),
+    ( 96,  16, 1024): (False, 16, 1),
+    ( 96,  16, 2048): (False, 16, 2),
+    ( 96,  32,    1): (False, 32, 2),
+    ( 96,  32,    2): (False, 32, 2),
+    ( 96,  32,    4): (False, 32, 2),
+    ( 96,  32,    8): (False, 32, 8),
+    ( 96,  32,   16): (False, 32, 4),
+    ( 96,  32,   32): (False, 16, 4),
+    ( 96,  32,   64): (False, 32, 4),
+    ( 96,  32,  128): (False, 64, 8),
+    ( 96,  32,  256): (False, 64, 8),
+    ( 96,  32,  512): (False, 16, 1),
+    ( 96,  32, 1024): (False, 32, 2),
+    ( 96,  32, 2048): (False, 32, 2),
+    ( 96,  64,    1): (False, 32, 2),
+    ( 96,  64,    2): (False, 32, 2),
+    ( 96,  64,    4): (False, 32, 2),
+    ( 96,  64,    8): (False, 32, 4),
+    ( 96,  64,   16): (False, 32, 4),
+    ( 96,  64,   32): (False, 16, 2),
+    ( 96,  64,   64): (False, 32, 4),
+    ( 96,  64,  128): (False, 64, 8),
+    ( 96,  64,  256): (False, 16, 1),
+    ( 96,  64,  512): (False, 32, 2),
+    ( 96,  64, 1024): (False, 32, 2),
+    ( 96,  64, 2048): (False, 32, 2),
+    ( 96, 128,    1): (False, 32, 2),
+    ( 96, 128,    2): (False, 32, 2),
+    ( 96, 128,    4): (False, 16, 2),
+    ( 96, 128,    8): (False, 16, 4),
+    ( 96, 128,   16): (False, 32, 4),
+    ( 96, 128,   32): (False, 32, 2),
+    ( 96, 128,   64): (False, 64, 8),
+    ( 96, 128,  128): (False, 32, 2),
+    ( 96, 128,  256): (False, 32, 2),
+    ( 96, 128,  512): (False, 32, 2),
+    ( 96, 128, 1024): (False, 32, 2),
+    ( 96, 128, 2048): (False, 32, 2),
+    (128,  16,    1): (False,  8, 8),
+    (128,  16,    2): (False,  8, 8),
+    (128,  16,    4): (False,  8, 1),
+    (128,  16,    8): (False,  8, 2),
+    (128,  16,   16): (False, 32, 4),
+    (128,  16,   32): (False, 32, 2),
+    (128,  16,   64): (False, 32, 4),
+    (128,  16,  128): (False, 32, 4),
+    (128,  16,  256): (False, 16, 4),
+    (128,  16,  512): (False, 32, 4),
+    (128,  16, 1024): (False, 64, 8),
+    (128,  16, 2048): (False, 64, 4),
+    (128,  32,    1): (False,  8, 1),
+    (128,  32,    2): (False, 16, 2),
+    (128,  32,    4): (False,  8, 2),
+    (128,  32,    8): (False,  8, 2),
+    (128,  32,   16): (False, 32, 2),
+    (128,  32,   32): (False, 32, 4),
+    (128,  32,   64): (False, 32, 4),
+    (128,  32,  128): (False, 32, 4),
+    (128,  32,  256): (False, 16, 4),
+    (128,  32,  512): (False, 64, 8),
+    (128,  32, 1024): (False, 64, 8),
+    (128,  32, 2048): (False, 64, 4),
+    (128,  64,    1): (False,  8, 1),
+    (128,  64,    2): (False,  8, 2),
+    (128,  64,    4): (False,  4, 2),
+    (128,  64,    8): (False, 32, 4),
+    (128,  64,   16): (False, 32, 4),
+    (128,  64,   32): (False, 32, 4),
+    (128,  64,   64): (False, 32, 4),
+    (128,  64,  128): (False, 64, 8),
+    (128,  64,  256): (False, 32, 8),
+    (128,  64,  512): (False, 64, 8),
+    (128,  64, 1024): (False, 64, 8),
+    (128,  64, 2048): (False, 64, 4),
+    (128, 128,    1): (False,  8, 1),
+    (128, 128,    2): (False, 32, 8),
+    (128, 128,    4): (False,  8, 1),
+    (128, 128,    8): (False, 32, 4),
+    (128, 128,   16): (False, 32, 4),
+    (128, 128,   32): (False, 32, 4),
+    (128, 128,   64): (False, 32, 4),
+    (128, 128,  128): (False, 64, 8),
+    (128, 128,  256): (False, 32, 8),
+    (128, 128,  512): (False, 64, 4),
+    (128, 128, 1024): (False, 64, 4),
+    (128, 128, 2048): (False, 64, 4),
+}
+
+_ssm_logger = logging.getLogger("vllm.mamba_ssm")
+_ssm_logged_configs = set()
+
+
+def _get_ssm_config(dstate, nheads, batch, is_blackwell):
+    """Look up optimal (use_tiled, BLOCK_SIZE_M, num_warps) from sweep."""
+    table = _SSM_CONFIG_B200 if is_blackwell else _SSM_CONFIG_H100
+    candidates = [(d, nh, b) for (d, nh, b) in table
+                  if d == dstate and nh == nheads and b <= batch]
+    if candidates:
+        key = max(candidates, key=lambda x: x[2])
+        result = table[key]
+    elif dstate == 96:
+        result = (True, 32, 2) if is_blackwell else (False, 32, 2)
+    else:
+        result = (False, 8, 1)
+
+    log_key = (dstate, nheads, batch)
+    if log_key not in _ssm_logged_configs:
+        _ssm_logged_configs.add(log_key)
+        use_tiled, m, w = result
+        kern = "tiled" if use_tiled else "orig"
+        _ssm_logger.info(
+            "SSM config: dstate=%d nheads=%d batch=%d -> %s M=%d w=%d",
+            dstate, nheads, batch, kern, m, w)
+    return result
+
 
 if TRITON3:
 
@@ -397,6 +630,7 @@ def selective_state_update(
 
     # Default
     BLOCK_SIZE_M, num_warps = 4, 8
+    use_tiled = False
 
     if dstate <= 16:
         BLOCK_SIZE_M, num_warps = 32, 4
@@ -405,12 +639,8 @@ def selective_state_update(
     elif dstate <= 64:
         BLOCK_SIZE_M, num_warps = 8, 4
     else:
-        # dstate > 64
-        if is_blackwell:
-            # Optimized for B200 with dstate>64
-            BLOCK_SIZE_M, num_warps = 32, 8
-        elif dstate <= 128:
-            BLOCK_SIZE_M, num_warps = 4, 4
+        use_tiled, BLOCK_SIZE_M, num_warps = _get_ssm_config(
+            dstate, nheads, N, is_blackwell)
 
     tie_hdim = (
         A.stride(-1) == 0
@@ -418,8 +648,16 @@ def selective_state_update(
         and dt.stride(-1) == 0
         and dt_bias.stride(-1) == 0
     )
+    if dstate > 64 and use_tiled:
+        from vllm.model_executor.layers.mamba.ops.mamba_ssm_tiled import (
+            _selective_scan_update_kernel_tiled,
+        )
+        _kern = _selective_scan_update_kernel_tiled
+    else:
+        _kern = _selective_scan_update_kernel
+
     with torch.cuda.device(x.device.index):
-        _selective_scan_update_kernel[grid](
+        _kern[grid](
             state,
             x,
             dt,
