@@ -1,0 +1,238 @@
+From 61700ab56c628cac501bf993acdbd3d48dd2e1a8 Mon Sep 17 00:00:00 2001
+From: Vladimir Anisimov <vanisimov@nvidia.com>
+Date: Mon, 5 Oct 2026 11:01:14 -0700
+Subject: [PATCH] sparse_topk_select: break boundary ties by lowest index, not
+ arrival order
+
+IndexerTopKWithSortKernel resolved an exact score tie at the top-k boundary
+by shared-memory atomicAdd arrival order, so identical inputs could select
+different blocks from run to run:
+
+- final selection (all-pairs rank loop and two-level warp merge): equal
+  scores were ordered by their staging position, which is the atomicAdd
+  order in which threshold-bin elements were staged;
+- step 3: the threshold bin (equal in key bits 2-31 only) was filled in
+  atomicAdd order, so it could even prefer a smaller score that differs
+  only in the two lowest bits.
+
+Both now use one fixed rule: higher score first, then the lower source
+(logical block) index.  The rank loop and the warp merge compare a
+(score, inverted index) key; step 3 fills its threshold bin in index order
+with a block scan, visiting the bin's low-bit classes from the highest
+score down and skipping classes the bin does not contain.
+
+Rows without a tie at the boundary select exactly what they selected
+before.  The histogram passes are order-independent counts and are
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../csrc/include/sparse_topk_select.cuh       | 127 ++++++++++++++----
+ 1 file changed, 101 insertions(+), 26 deletions(-)
+
+diff --git a/python/fmha_sm100/csrc/include/sparse_topk_select.cuh b/python/fmha_sm100/csrc/include/sparse_topk_select.cuh
+index cc97a8e..0bacb52 100644
+--- a/python/fmha_sm100/csrc/include/sparse_topk_select.cuh
++++ b/python/fmha_sm100/csrc/include/sparse_topk_select.cuh
+@@ -250,6 +250,9 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t&
+   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
+     smemFinal.histo.data[idx] = 0;
+   }
++  if constexpr (step == 3) {
++    if (threadIdx.x == 0) smemFinalDstIdx[0] = 0;  // step 3: low-bit classes seen in the bin
++  }
+   __syncthreads();
+ 
+   // Update pattern.
+@@ -345,11 +348,19 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t&
+           smemFinal.items.indices[dstIdx] = idx;
+         }
+       } else {
++        // Step 3 does not fill its threshold bin here: more elements may match
++        // than slots remain, and filling in atomicAdd arrival order makes the
++        // selection depend on thread scheduling.  SelectStep3ThresholdBin fills
++        // the remaining slots in a fixed order instead.  Here we only note which
++        // values of key bits 0-1 occur in the bin (smemFinalDstIdx is unused at
++        // step 3: staging ends the refinement before step 3 is reached).
+         if (binIdx == thresholdBinIdx) {
+-          // Elements in the threshold bin share the same 32 bits at step 3.
+-          int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
+-          if (dstIdx < topK) {
+-            smemOutput[dstIdx] = idx;
++          uint32_t bits = __float_as_uint(logit);
++          bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
++          const int present = 1 << (bits & 3u);
++          // The plain read only skips redundant atomics; a stale read is harmless.
++          if ((*reinterpret_cast<volatile int*>(smemFinalDstIdx) & present) == 0) {
++            atomicOr(&smemFinalDstIdx[0], present);
+           }
+         }
+       }
+@@ -364,6 +375,53 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t&
+   return smemFinalBinSize[0] > kNumFinalItems;
+ }
+ 
++// Deterministic fill of the remaining top-k slots from the step-3 threshold bin.
++//
++// After step 3 every element of the threshold bin agrees with `pattern30` in
++// bits 2..31 of the ordering key (extractBinIdx<3> drops bits 0-1).  The
++// remaining slots are filled in the order the rest of the kernel ranks
++// candidates: higher score first (smaller key bits 0-1), then, among
++// bitwise-equal scores, the LOWER source index first.  Elements are visited in
++// index order with a block-wide scan, so the result does not depend on thread
++// or atomic ordering.  `classes` (bit c set = some element has key bits 0-1
++// equal to c, recorded by step 3) lets absent classes be skipped.  Only rows
++// whose top-20-bit threshold bin overflows kNumFinalItems reach this path.
++template <int kNumThreadsPerBlock, typename ScanStorage>
++__device__ void SelectStep3ThresholdBin(float const* logits, int rowEnd, uint32_t pattern30,
++                                        int classes, int32_t* smemOutput, int* smemFoundTopKValues,
++                                        ScanStorage& scanStorage, int rowStart, int topK,
++                                        uint32_t force_begin, uint32_t force_end_start,
++                                        uint32_t row_num_valid_pages) {
++  using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
++  int filled = smemFoundTopKValues[0];
++  const int rowLen = rowEnd - rowStart;
++  for (uint32_t low = 0; low < 4 && filled < topK; ++low) {
++    if ((classes & (1 << low)) == 0) continue;
++    const uint32_t wanted = pattern30 | low;
++    for (int base = 0; base < rowLen && filled < topK; base += kNumThreadsPerBlock) {
++      const int idx = base + static_cast<int>(threadIdx.x);
++      int match = 0;
++      if (idx < rowLen) {
++        const uint32_t k = static_cast<uint32_t>(rowStart + idx);
++        const float logit = IsForcedBlock(k, force_begin, force_end_start, row_num_valid_pages)
++                                ? FLT_MAX
++                                : logits[rowStart + idx];
++        uint32_t bits = __float_as_uint(logit);
++        bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
++        match = bits == wanted ? 1 : 0;
++      }
++      int position = 0, total = 0;
++      Scan(scanStorage).ExclusiveSum(match, position, total);
++      __syncthreads();  // scanStorage is reused by the next scan
++      if (match && filled + position < topK) {
++        smemOutput[filled + position] = idx;
++      }
++      filled += total;  // block-uniform: every thread gets the same total
++    }
++  }
++  __syncthreads();
++}
++
+ // =============================================================================
+ // Transpose kernel — reused verbatim from v1.6.5_2cta_per_row_qo_outermost
+ // =============================================================================
+@@ -575,14 +633,12 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out,
+ constexpr int kFinalCandidateSourceBits = 14;
+ constexpr uint64_t kFinalCandidateSourceMask = (1ull << kFinalCandidateSourceBits) - 1;
+ 
+-// Pack score, staging position, and source index into one sortable key.  The
+-// high 32 bits preserve numeric float order.  Staging position is next so an
+-// equal-score tie follows the legacy rank loop, which preferred larger staged
+-// positions (`i < j` incremented i's rank).  The source index is payload in the
+-// low 14 bits; max_k_tiles is constrained to < 12288 by the dispatcher.
+-__device__ __forceinline__ uint64_t MakeFinalCandidateKey(float logit,
+-                                                         int staging_position,
+-                                                         int source_index) {
++// Pack score and source index into one sortable key (sorted descending).  The
++// high 32 bits preserve numeric float order.  An equal-score tie goes to the
++// LOWER source index, independent of the (atomicAdd-ordered) staging position,
++// so the low 14 bits hold the inverted source index.  max_k_tiles is
++// constrained to < 12288 by the dispatcher.  FinalCandidateSourceIndex inverts.
++__device__ __forceinline__ uint64_t MakeFinalCandidateKey(float logit, int source_index) {
+   // Numeric comparison treats -0.0f and +0.0f as equal, so canonicalize zero
+   // before converting the score to an integer ordering key.
+   const uint32_t raw_bits = __float_as_uint(logit);
+@@ -590,8 +646,11 @@ __device__ __forceinline__ uint64_t MakeFinalCandidateKey(float logit,
+   const uint32_t ordered_bits =
+       (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+   return (static_cast<uint64_t>(ordered_bits) << 32) |
+-         (static_cast<uint64_t>(staging_position) << kFinalCandidateSourceBits) |
+-         static_cast<uint32_t>(source_index);
++         (kFinalCandidateSourceMask - static_cast<uint64_t>(source_index));
++}
++
++__device__ __forceinline__ int FinalCandidateSourceIndex(uint64_t key) {
++  return static_cast<int>(kFinalCandidateSourceMask - (key & kFinalCandidateSourceMask));
+ }
+ 
+ struct FinalCandidateKeyGreater {
+@@ -874,12 +933,17 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
+             force_begin, force_end_start, row_num_valid_pages);
+   }
+   if (continueToNextStep) {
+-    // Stage 3: fp32 low 10 bits.  After this step every remaining tie shares
+-    // the same 32-bit pattern so we just fill the topk window directly.
++    // Stage 3: fp32 bits 2-11.  It emits the bins above the threshold; the
++    // threshold bin (equal in bits 2-31) is then filled in a fixed order:
++    // higher score, then lower index.
+     processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems>(
+         logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
+         smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, rowStart, topK,
+         force_begin, force_end_start, row_num_valid_pages);
++    SelectStep3ThresholdBin<kNumThreadsPerBlock>(
++        logits, rowEnd, logitPattern | (static_cast<uint32_t>(thresholdBinIdx & 0x3ff) << 2),
++        smemFinalDstIdx[0], smemOutput, smemFoundTopKValues, smemFinal.histo.scan, rowStart,
++        topK, force_begin, force_end_start, row_num_valid_pages);
+   }
+ 
+   if (!continueToNextStep) {
+@@ -895,17 +959,29 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
+     const int selectionWarp = threadIdx.x >> 5;
+ 
+     if (finalCount <= kIndexerQuadraticSelectionLimit) {
+-      for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock) {
++      // Rank by the (score, lower source index) key of MakeFinalCandidateKey:
++      // equal scores no longer fall back to the staging position, which is
++      // atomicAdd arrival order.  One candidate per thread; the keys overwrite
++      // items.indices once every candidate has been read into registers.
++      static_assert(kIndexerQuadraticSelectionLimit <= kNumThreadsPerBlock);
++      static_assert(kIndexerQuadraticSelectionLimit * sizeof(uint64_t) <=
++                    sizeof(smemFinal.items.indices));
++      const bool hasCandidate = static_cast<int>(threadIdx.x) < finalCount;
++      const uint64_t key =
++          hasCandidate ? MakeFinalCandidateKey(smemFinal.items.logits[threadIdx.x],
++                                               smemFinal.items.indices[threadIdx.x])
++                       : 0;
++      __syncthreads();
++      uint64_t* smemKeys = reinterpret_cast<uint64_t*>(smemFinal.items.indices);
++      if (hasCandidate) smemKeys[threadIdx.x] = key;
++      __syncthreads();
++      if (hasCandidate) {
+         int outIndex = 0;
+-        const float logit = smemFinal.items.logits[i];
+         for (int j = 0; j < finalCount; ++j) {
+-          const float otherLogit = smemFinal.items.logits[j];
+-          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+-            ++outIndex;
+-          }
++          outIndex += smemKeys[j] > key ? 1 : 0;
+         }
+         if (outIndex + baseIdx < topK) {
+-          smemOutput[outIndex + baseIdx] = smemFinal.items.indices[i];
++          smemOutput[outIndex + baseIdx] = FinalCandidateSourceIndex(key);
+         }
+       }
+       __syncthreads();
+@@ -918,7 +994,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
+         const int position = threadIdx.x + item * kNumThreadsPerBlock;
+         candidateKeys[item] =
+             position < finalCount
+-                ? MakeFinalCandidateKey(smemFinal.items.logits[position], position,
++                ? MakeFinalCandidateKey(smemFinal.items.logits[position],
+                                         smemFinal.items.indices[position])
+                 : 0;
+       }
+@@ -956,8 +1032,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
+         for (int item = 0; item < kWarpCandidatesPerLane; ++item) {
+           const int rank = selectionLane * kWarpCandidatesPerLane + item;
+           if (rank < numFinalSelections) {
+-            smemOutput[baseIdx + rank] = static_cast<int>(
+-                warpCandidateKeys[item] & kFinalCandidateSourceMask);
++            smemOutput[baseIdx + rank] = FinalCandidateSourceIndex(warpCandidateKeys[item]);
+           }
+         }
+       }
+-- 
+2.43.0
+
