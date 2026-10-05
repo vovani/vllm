@@ -14,11 +14,16 @@ if(FMHA_SM100_SRC_DIR)
     BUILD_COMMAND ""
   )
 else()
+  # Fixes applied on top of the pinned MSA commit until they are upstream.
+  # The command is idempotent (a re-populate of an already patched tree skips).
+  set(FMHA_SM100_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/patches/fmha_sm100_sparse_topk_deterministic_tiebreak.patch")
   FetchContent_Declare(
     fmha_sm100
     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
     GIT_TAG be4a52aea420b6bef73be9af1a649859964790cb
     GIT_PROGRESS TRUE
+    PATCH_COMMAND sh -c "git apply --reverse --check '${FMHA_SM100_PATCH}' 2>/dev/null || git apply '${FMHA_SM100_PATCH}'"
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
   )
