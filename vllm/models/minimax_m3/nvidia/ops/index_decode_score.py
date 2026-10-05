@@ -287,6 +287,11 @@ class IndexDecodeScoreKernel:
                 cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
                 for q in cutlass.range_constexpr(Q_TILES):
                     cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
+                # The ldmatrix reads above are generic-proxy accesses; the TMA that
+                # refills this stage after the release is an async-proxy write.
+                # Without a proxy fence the release does not order them and the TMA
+                # can overwrite the stage while the reads are still in flight.
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 tma_stage = 1 % self.num_stages
@@ -342,6 +347,9 @@ class IndexDecodeScoreKernel:
                                         rC[None, m, n],
                                     )
 
+                    # Order this stage's ldmatrix reads before the TMA refill
+                    # (see the Q release above).
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                     k_start = block_id * BLOCK_K + warp_id * 32
